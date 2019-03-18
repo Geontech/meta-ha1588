@@ -1,0 +1,8 @@
+define KFEATURE_DESCRIPTION "Enable HA1588 RTC IP Core Driver"
+define KFEATURE_COMPATIBILITY board
+
+patch 0001-ha1588-kconfig-makefile.patch
+patch 0002-ha1588-c.patch
+patch 0003-ha1588-h.patch
+
+kconfig hardware ha1588.cfg

@@ -1,0 +1,443 @@
+--- /dev/null	2019-03-18 07:12:31.283264255 -0400
++++ kernel-source/drivers/rtc/rtc-ha1588.c	2019-03-18 08:18:23.000000000 -0400
+@@ -0,0 +1,440 @@
++/*
++ * HA1588 IP Core Real Time Clock Kernel Driver
++ *
++ * Copyright (C) 2018 Geon Technologies, LLC.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program. If not, see <http://www.gnu.org/licenses/>.
++ *
++ * The FPGA IP core is located here: https://opencores.org/project/ha1588
++ * Date of revision: 2018 April 11
++ * 
++ * HA1588's IP core supports:
++ *      48 bits seconds
++ *      40 bits nanoseconds
++ *      Advance and retard time
++ *      40 bits (8/32) Clock period adjustment
++ */
++
++#include <linux/delay.h>
++#include <linux/init.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/rtc.h>
++#include <linux/rtc/ha1588.h>
++
++#ifdef CONFIG_PTP_1588_CLOCK
++#include <linux/ptp_clock_kernel.h>
++#include <linux/spinlock.h>
++#endif
++
++extern int axienet_phc_index;
++
++#define HA1588_RTC_DEVICETREE_COMPATIBILITY "ha1588,rtc-1.0"
++#define HA1588_RTC_DEVICETREE_PERIOD        "ha1588,period"
++
++#define HA1588_RTC_CTRL           0x00000000
++#define HA1588_RTC_NULL_0x04      0x00000004
++#define HA1588_RTC_NULL_0x08      0x00000008
++#define HA1588_RTC_NULL_0x0C      0x0000000C
++#define HA1588_RTC_TIME_SEC_H     0x00000010
++#define HA1588_RTC_TIME_SEC_L     0x00000014
++#define HA1588_RTC_TIME_NSC_H     0x00000018
++#define HA1588_RTC_TIME_NSC_L     0x0000001C
++#define HA1588_RTC_PERIOD_H       0x00000020
++#define HA1588_RTC_PERIOD_L       0x00000024
++#define HA1588_RTC_ADJPER_H       0x00000028
++#define HA1588_RTC_ADJPER_L       0x0000002C
++#define HA1588_RTC_ADJNUM         0x00000030
++#define HA1588_RTC_NULL_0x34      0x00000034
++#define HA1588_RTC_NULL_0x38      0x00000038
++#define HA1588_RTC_NULL_0x3C      0x0000003C
++
++// define RTC control values
++#define HA1588_RTC_SET_CTRL_0     0x00
++#define HA1588_RTC_GET_TIME       0x01
++#define HA1588_RTC_SET_ADJ        0x02
++#define HA1588_RTC_SET_PERIOD     0x04
++#define HA1588_RTC_SET_TIME       0x08
++#define HA1588_RTC_SET_RESET      0x10
++
++struct ha1588_rtc_dev {
++    struct rtc_device *rtc;
++    void __iomem      *reg_base;
++};
++
++/**
++ * Read the 64-bit period from the device tree (nanoseconds)
++ *  8 bits whole
++ * 32 bits fraction
++ */
++int ha1588_rtc_read_dt_period(struct device *dev, u64 *period)
++{
++    u64 val;
++    int ret = of_property_read_u64(dev->of_node, HA1588_RTC_DEVICETREE_PERIOD, &val);
++    *period = (val & 0xFFFFFFFFFF); /* 40 bits mask */
++    return ret;
++}
++EXPORT_SYMBOL(ha1588_rtc_read_dt_period);
++
++/**
++ * Set RTC seconds and nanoseconds
++ * sec:  48 bits whole seconds
++ * nsec: 63-62 unused
++ *       61-32 whole nanoseconds
++ *       31- 8 unused
++ *        7- 0 fraction nanoseconds
++ */
++int ha1588_rtc_set_timespec64(struct device *dev, const struct timespec64 *ts)
++{
++    struct ha1588_rtc_dev *rtcdev = dev_get_drvdata(dev);
++
++    writel((u32) (ts->tv_sec >> 32),          rtcdev->reg_base + HA1588_RTC_TIME_SEC_H);
++    writel((u32) ts->tv_sec,                  rtcdev->reg_base + HA1588_RTC_TIME_SEC_L);
++    writel((u32) (ts->tv_nsec && 0x3FFFFFFF), rtcdev->reg_base + HA1588_RTC_TIME_NSC_H);
++    writel(0,                                 rtcdev->reg_base + HA1588_RTC_TIME_NSC_L);
++    writel(HA1588_RTC_SET_CTRL_0,             rtcdev->reg_base + HA1588_RTC_CTRL);
++    writel(HA1588_RTC_SET_TIME,               rtcdev->reg_base + HA1588_RTC_CTRL);
++    return 0;
++}
++EXPORT_SYMBOL(ha1588_rtc_set_timespec64);
++
++/**
++ * Read RTC seconds and nanoseconds
++ * sec:  48 bits whole seconds
++ * nsec: 63-62 unused
++ *       61-32 whole nanoseconds
++ *       31- 8 unused
++ *        7- 0 fraction nanoseconds
++ */
++int ha1588_rtc_read_timespec64(struct device *dev, struct timespec64 *ts)
++{
++    struct ha1588_rtc_dev *rtcdev = dev_get_drvdata(dev);
++    time64_t sec;
++    long nsec;
++    u32 h, l;
++    int ret;
++
++    // write to read control, wait, read values back.
++    writel(HA1588_RTC_SET_CTRL_0, rtcdev->reg_base + HA1588_RTC_CTRL);
++    writel(HA1588_RTC_GET_TIME,   rtcdev->reg_base + HA1588_RTC_CTRL);
++    do {
++        ret = readl(rtcdev->reg_base + HA1588_RTC_CTRL);
++    } while ((ret & HA1588_RTC_GET_TIME) == 0x0);
++
++    // Get nanoseconds and round based on the fractional bits.
++    h = readl(rtcdev->reg_base + HA1588_RTC_TIME_NSC_H);
++    l = readl(rtcdev->reg_base + HA1588_RTC_TIME_NSC_L);
++    nsec = h;
++    nsec += ((127U < l) ? 1 : 0);
++
++    // Get seconds.  Add 1 and reset nsec if necessary.
++    h = readl(rtcdev->reg_base + HA1588_RTC_TIME_SEC_H);
++    l = readl(rtcdev->reg_base + HA1588_RTC_TIME_SEC_L);
++
++    sec = (time64_t) h << 32 | l;
++    if (NSEC_PER_SEC <= nsec) {
++        nsec = 0;
++        sec += 1;
++    }
++
++    dev_dbg(dev, "Read Seconds: 0x%016llx, Nanoseconds: 0x%016llx\n", sec, nsec);
++
++    ts->tv_sec  = sec;
++    ts->tv_nsec = nsec;
++
++    return 0;
++}
++EXPORT_SYMBOL(ha1588_rtc_read_timespec64);
++
++/* Set ADJ */
++int ha1588_rtc_set_adj(struct device *dev, u32 count, s64 nsec)
++{
++    struct ha1588_rtc_dev *rtcdev = dev_get_drvdata(dev);
++    s32 wnsec = ((nsec >> 32) & 0xFF);
++    s32 fnsec = (nsec & 0xFFFFFFFF);
++
++    writel(count,                 rtcdev->reg_base + HA1588_RTC_ADJNUM);
++    writel(wnsec,                 rtcdev->reg_base + HA1588_RTC_ADJPER_H);
++    writel(fnsec,                 rtcdev->reg_base + HA1588_RTC_ADJPER_L);
++    writel(HA1588_RTC_SET_CTRL_0, rtcdev->reg_base + HA1588_RTC_CTRL);
++    writel(HA1588_RTC_SET_ADJ,    rtcdev->reg_base + HA1588_RTC_CTRL);
++    return 0;
++}
++EXPORT_SYMBOL(ha1588_rtc_set_adj);
++
++/*
++ * Sets the clock period, which adjusts how fast or slowly "time"
++ * accumulates in the core relative to the input clock.
++ * clock < period --> "time" accumulates faster
++ * clock > period --> "time" accumulates slower
++ * 
++ * period: 8 bits whole, 32 bit fractional nanoseconds
++ * 
++ */
++static int ha1588_rtc_set_period(struct device *dev, u64 period)
++{
++    struct ha1588_rtc_dev *rtcdev = dev_get_drvdata(dev);
++    u32 period_ns  = ((period >> 32) & 0xFF);
++    u32 period_fns = (period & 0xFFFFFFFFF);
++
++    writel(period_ns,             rtcdev->reg_base + HA1588_RTC_PERIOD_H);
++    writel(period_fns,            rtcdev->reg_base + HA1588_RTC_PERIOD_L);
++    writel(HA1588_RTC_SET_CTRL_0, rtcdev->reg_base + HA1588_RTC_CTRL);
++    writel(HA1588_RTC_SET_PERIOD, rtcdev->reg_base + HA1588_RTC_CTRL);
++    return 0;
++}
++
++static int ha1588_rtc_set_time(struct device *dev, struct rtc_time *tm)
++{
++    struct timespec64 ts;
++    ts.tv_sec = rtc_tm_to_time64(tm);
++    ts.tv_nsec = 0;
++    return ha1588_rtc_set_timespec64(dev, &ts);
++}
++
++static int ha1588_rtc_read_time(struct device *dev, struct rtc_time *tm)
++{
++    struct timespec64 ts;
++    time64_t read_time = 0;
++    ha1588_rtc_read_timespec64(dev, &ts);
++
++    // Add a second (round up) based on tv_nsec.
++    read_time = ts.tv_sec;
++    read_time += ((ts.tv_nsec < (NSEC_PER_SEC >> 1)) ? 0 : 1);
++    rtc_time64_to_tm(read_time, tm);
++    return rtc_valid_tm(tm);
++}
++
++/**
++ * Calculates the new period for the core's accumulator
++ * by using the value from the device tree and offset,
++ * in parts per billion.
++ */
++int ha1588_rtc_set_offset(struct device *dev, long offset)
++{
++    int ret = 0,
++        neg_adj = 0;
++    u64 freq, period;
++    u32 diff;
++
++    /* Read the clock period from the RTC */
++    ha1588_rtc_read_dt_period(dev, &period);
++
++    if (offset < 0) {
++        neg_adj = 1;
++        offset = -offset;
++    }
++
++    freq = period;
++    freq *= offset;
++    diff = div_u64(freq, 1000000000ULL);
++
++    period = neg_adj ? (period - diff) : (period + diff);
++    ret = ha1588_rtc_set_period(dev, period);
++    return ret;
++}
++EXPORT_SYMBOL(ha1588_rtc_set_offset);
++
++/**
++ * Read the frequency offset, parts per billion
++ * NOTE: this is not implemented in the HA1588.
++ * Per rtc/interface.c, returning: -EINVAL.
++ */
++static int ha1588_rtc_read_offset(struct device *dev, long *offset)
++{
++    return -EINVAL;
++}
++
++static const struct rtc_class_ops ha1588_rtc_ops = {
++    .set_time    = ha1588_rtc_set_time,
++    .read_time   = ha1588_rtc_read_time,
++    .set_offset  = ha1588_rtc_set_offset,
++    .read_offset = ha1588_rtc_read_offset,
++};
++
++#if defined(CONFIG_PTP_1588_CLOCK)
++struct ha1588_ptp_timer {
++    struct device         *dev;
++    struct ptp_clock      *ptp_clock;
++    struct ptp_clock_info  ptp_clock_info;
++    spinlock_t             reg_lock;
++};
++
++static int ha1588_ptp_adjfreq(struct ptp_clock_info *ptp, s32 ppb)
++{
++    struct ha1588_ptp_timer *timer = container_of(ptp, struct ha1588_ptp_timer,
++        ptp_clock_info);
++    int ret;
++
++    ret = ha1588_rtc_set_offset(timer->dev, ppb);
++    return ret;
++}
++
++static int ha1588_ptp_gettime64(struct ptp_clock_info *ptp, struct timespec64 *ts)
++{
++    struct ha1588_ptp_timer *timer = container_of(ptp, struct ha1588_ptp_timer,
++        ptp_clock_info);
++    unsigned long flags;
++    int ret;
++
++    spin_lock_irqsave(&timer->reg_lock, flags);
++    ret = ha1588_rtc_read_timespec64(timer->dev, ts);
++    spin_unlock_irqrestore(&timer->reg_lock, flags);
++
++    return ret;
++}
++
++/**
++ * ha1588_ptp_settime64 - Set the current time on the hardware clock
++ * @ptp: ptp clock structure
++ * @ts: timespec64 containing the new time for the cycle counter
++ *
++ * Return: 0 in all cases.
++ *
++ **/
++static int ha1588_ptp_settime64(struct ptp_clock_info *ptp,
++    const struct timespec64 *ts)
++{
++    struct ha1588_ptp_timer *timer = container_of(ptp, struct ha1588_ptp_timer,
++                            ptp_clock_info);
++    unsigned long flags;
++    int ret;
++
++    /* Write the time to the RTC */
++    spin_lock_irqsave(&timer->reg_lock, flags);
++    ret = ha1588_rtc_set_timespec64(timer->dev, ts);
++    spin_unlock_irqrestore(&timer->reg_lock, flags);
++
++    return ret;
++}
++
++static int ha1588_ptp_adjtime(struct ptp_clock_info *ptp, s64 delta)
++{
++    struct ha1588_ptp_timer *timer = container_of(ptp, struct ha1588_ptp_timer,
++        ptp_clock_info);
++    struct timespec64 now, then = ns_to_timespec64(delta);
++    unsigned long flags;
++    int ret;
++
++    spin_lock_irqsave(&timer->reg_lock, flags);
++    ha1588_rtc_read_timespec64(timer->dev, &now);
++    now = timespec64_add(now, then);
++    ret = ha1588_rtc_set_timespec64(timer->dev, (const struct timespec64 *) &now);
++    spin_unlock_irqrestore(&timer->reg_lock, flags);
++
++    return ret;
++}
++
++static int ha1588_ptp_enable(struct ptp_clock_info *ptp,
++    struct ptp_clock_request *rq, int on)
++{
++    return -EOPNOTSUPP;
++}
++
++static struct ptp_clock_info ha1588_ptp_caps = {
++    .owner     = THIS_MODULE,
++    .name      = "axienet ptp",
++    .max_adj   = 20000000, // 2% clock variation in ppb
++    .n_alarm   = 0,
++    .n_ext_ts  = 0,
++    .n_per_out = 0,
++    .pps       = 0,
++    .adjfreq   = ha1588_ptp_adjfreq,
++    .adjtime   = ha1588_ptp_adjtime,
++    .gettime64 = ha1588_ptp_gettime64,
++    .settime64 = ha1588_ptp_settime64,
++    .enable    = ha1588_ptp_enable,
++};
++#endif
++
++static int ha1588_rtc_probe(struct platform_device *pdev)
++{
++    struct ha1588_rtc_dev *rtcdev;
++    struct resource *res;
++    int ret;
++    u64 period_dt;
++
++    rtcdev = devm_kzalloc(&pdev->dev, sizeof(*rtcdev), GFP_KERNEL);
++    if (!rtcdev)
++        return -ENOMEM;
++
++    platform_set_drvdata(pdev, rtcdev);
++
++    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++
++    rtcdev->reg_base = devm_ioremap_resource(&pdev->dev, res);
++    if (IS_ERR(rtcdev->reg_base))
++        return PTR_ERR(rtcdev->reg_base);
++
++    // Configure initial clock period
++    ret = ha1588_rtc_read_dt_period(&pdev->dev, &period_dt);
++    if (ret) {
++        dev_err(&pdev->dev, "Clock period %s not defined.", HA1588_RTC_DEVICETREE_PERIOD);
++        return ret;
++    }
++    ha1588_rtc_set_period(&pdev->dev, period_dt);
++
++    rtcdev->rtc = devm_rtc_device_register(&pdev->dev, pdev->name,
++                     &ha1588_rtc_ops, THIS_MODULE);
++
++#if defined(CONFIG_PTP_1588_CLOCK)
++    // Register the PTP clock
++    struct ha1588_ptp_timer *timer;
++    struct timespec64         ts;
++
++    timer = kzalloc(sizeof(*timer), GFP_KERNEL);
++
++    if (!timer)
++        return NULL;
++
++    timer->dev = &pdev->dev;
++    timer->ptp_clock_info = ha1588_ptp_caps;
++    timer->ptp_clock = ptp_clock_register(&timer->ptp_clock_info,  &pdev->dev);
++
++    if (IS_ERR(timer->ptp_clock)) {
++        ret = PTR_ERR(timer->ptp_clock);
++        pr_debug("Failed to register ptp clock\n");
++        timer->ptp_clock = NULL;
++    }
++
++    // axienet_phc_index = ptp_clock_index(timer->ptp_clock);
++    spin_lock_init(&timer->reg_lock);
++    ts = ktime_to_timespec64(ktime_get_real());
++    ha1588_ptp_settime64(&timer->ptp_clock_info, &ts);
++#endif
++    
++    return PTR_ERR_OR_ZERO(rtcdev->rtc);
++}
++
++static const struct of_device_id ha1588_rtc_of_match[] = {
++    {.compatible = HA1588_RTC_DEVICETREE_COMPATIBILITY },
++    { }
++};
++MODULE_DEVICE_TABLE(of, ha1588_rtc_of_match);
++
++static struct platform_driver ha1588_rtc_driver = {
++    .probe      = ha1588_rtc_probe,
++    .driver     = {
++        .name   = KBUILD_MODNAME,
++        .of_match_table = ha1588_rtc_of_match,
++    },
++};
++
++module_platform_driver(ha1588_rtc_driver);
++
++MODULE_DESCRIPTION("HA1588 RTC IP Core Kernel driver");
++MODULE_AUTHOR("Geon Technologies, LLC");
++MODULE_LICENSE("GPL v2");
++MODULE_ALIAS("platform:rtc-ha1588");
