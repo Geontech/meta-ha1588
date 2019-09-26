@@ -36,6 +36,7 @@
 +#include <linux/platform_device.h>
 +#include <linux/rtc.h>
 +#include <linux/rtc/ha1588.h>
++#include <linux/slab.h>
 +
 +#ifdef CONFIG_PTP_1588_CLOCK
 +#include <linux/ptp_clock_kernel.h>
